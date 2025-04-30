@@ -565,6 +565,8 @@ dependencies = [
  "rand",
  "regex",
  "rustc_version",
+ "serde",
+ "serde_json",
  "smallvec",
  "tempfile",
  "ui_test",

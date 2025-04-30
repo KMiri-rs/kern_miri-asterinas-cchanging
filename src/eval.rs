@@ -16,6 +16,7 @@ use rustc_session::config::EntryFnType;
 
 use crate::concurrency::thread::TlsAllocAction;
 use crate::diagnostics::report_leaks;
+use crate::mirch::PhysConfig;
 use crate::shims::tls;
 use crate::*;
 
@@ -157,6 +158,8 @@ pub struct MiriConfig {
     pub address_reuse_rate: f64,
     /// Probability for address reuse across threads.
     pub address_reuse_cross_thread_rate: f64,
+    /// Configurations for pseudo physical memory.
+    pub pseudo_physical_mem_config: PhysConfig,
 }
 
 impl Default for MiriConfig {
@@ -184,7 +187,7 @@ impl Default for MiriConfig {
             backtrace_style: BacktraceStyle::Short,
             provenance_mode: ProvenanceMode::Default,
             mute_stdout_stderr: false,
-            preemption_rate: 0.01, // 1%
+            preemption_rate: 0.0, // 1%
             report_progress: None,
             retag_fields: RetagFields::Yes,
             native_lib: None,
@@ -194,6 +197,7 @@ impl Default for MiriConfig {
             collect_leak_backtraces: true,
             address_reuse_rate: 0.5,
             address_reuse_cross_thread_rate: 0.1,
+            pseudo_physical_mem_config: PhysConfig::default(),
         }
     }
 }
@@ -433,6 +437,8 @@ pub fn eval_entry<'tcx>(
     // Copy setting before we move `config`.
     let ignore_leaks = config.ignore_leaks;
 
+    mirch::init_pseudo_physical_mem(config.pseudo_physical_mem_config);
+
     let mut ecx = match create_ecx(tcx, entry_id, entry_type, &config).report_err() {
         Ok(v) => v,
         Err(err) => {
@@ -442,6 +448,10 @@ pub fn eval_entry<'tcx>(
         }
     };
 
+    unsafe {
+        let page_table = mirch::init_boot_pt();
+        mirch::set_page_table(page_table);
+    }
     // Perform the main execution.
     let res: thread::Result<InterpResult<'_, !>> =
         panic::catch_unwind(AssertUnwindSafe(|| ecx.run_threads()));
@@ -463,6 +473,12 @@ pub fn eval_entry<'tcx>(
     }
 
     // Process the result.
+    let mut index = 0;
+    for time_record in &ecx.machine.record {
+        println!("{}, time: {:?}", index, time_record);
+        index += 1;
+    }
+
     let (return_code, leak_check) = report_error(&ecx, err)?;
     if leak_check && !ignore_leaks {
         // Check for thread leaks.

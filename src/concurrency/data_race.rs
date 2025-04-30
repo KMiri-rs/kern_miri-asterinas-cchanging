@@ -894,7 +894,8 @@ impl VClockAlloc {
                 | MiriMemoryKind::Machine
                 | MiriMemoryKind::Runtime
                 | MiriMemoryKind::ExternStatic
-                | MiriMemoryKind::Tls,
+                | MiriMemoryKind::Tls
+                | MiriMemoryKind::Kernel,
             )
             | MemoryKind::CallerLocation =>
                 (VTimestamp::ZERO, global.thread_index(ThreadId::MAIN_THREAD)),
@@ -1043,6 +1044,9 @@ impl VClockAlloc {
         ty: Option<Ty<'_>>,
         machine: &MiriMachine<'_>,
     ) -> InterpResult<'tcx> {
+        if machine.cpu_local_alloc_set.borrow().get(&alloc_id).is_some() {
+            return interp_ok(());
+        }
         let current_span = machine.current_span();
         let global = machine.data_race.as_ref().unwrap();
         if !global.race_detecting() {
@@ -1085,6 +1089,9 @@ impl VClockAlloc {
         ty: Option<Ty<'_>>,
         machine: &mut MiriMachine<'_>,
     ) -> InterpResult<'tcx> {
+        if machine.cpu_local_alloc_set.borrow().get(&alloc_id).is_some() {
+            return interp_ok(());
+        }
         let current_span = machine.current_span();
         let global = machine.data_race.as_mut().unwrap();
         if !global.race_detecting() {

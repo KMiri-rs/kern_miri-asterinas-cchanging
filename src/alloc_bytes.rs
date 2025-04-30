@@ -5,6 +5,8 @@ use std::{alloc, slice};
 use rustc_abi::{Align, Size};
 use rustc_middle::mir::interpret::AllocBytes;
 
+use crate::mirch::is_in_physical_mem;
+
 /// Allocation bytes that explicitly handle the layout of the data they're storing.
 /// This is necessary to interface with native code that accesses the program store in Miri.
 #[derive(Debug)]
@@ -28,6 +30,11 @@ impl Clone for MiriAllocBytes {
 
 impl Drop for MiriAllocBytes {
     fn drop(&mut self) {
+        // We do not need to explicitly drop the allocation in pseudo physical memory.
+        if is_in_physical_mem(self.ptr.cast()) {
+            return;
+        }
+
         // We have to reconstruct the actual layout used for allocation.
         // (`Deref` relies on `size` so we can't just always set it to at least 1.)
         let alloc_layout = if self.layout.size() == 0 {
@@ -88,6 +95,19 @@ impl AllocBytes for MiriAllocBytes {
         let slice = slice.into();
         let size = slice.len();
         let align = align.bytes();
+
+        // We can use the slice directly if it is in physical memory.
+        let slice_ref =  slice.as_ref();
+        if is_in_physical_mem(slice_ref as *const [u8] as *const ()) {
+            let layout = Layout::from_size_align(size, align as usize).unwrap();
+            let ptr = slice_ref as *const [u8] as *const u8 as *mut u8;
+
+            return Self {
+                ptr,
+                layout
+            }
+        }
+        
         // SAFETY: `alloc_fn` will only be used with `size != 0`.
         let alloc_fn = |layout| unsafe { alloc::alloc(layout) };
         let alloc_bytes = MiriAllocBytes::alloc_with(size.try_into().unwrap(), align, alloc_fn)

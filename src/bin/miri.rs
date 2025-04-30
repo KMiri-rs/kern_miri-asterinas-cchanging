@@ -646,6 +646,8 @@ fn main() {
                 show_error!("-Zmiri-force-page-size requires a power of 2: {page_size}");
             };
             miri_config.page_size = Some(page_size);
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-kern-miri-config-json-path=") {
+            miri_config.pseudo_physical_mem_config = miri::parse_json_file(param).unwrap();
         } else {
             // Forward to rustc.
             rustc_args.push(arg);
