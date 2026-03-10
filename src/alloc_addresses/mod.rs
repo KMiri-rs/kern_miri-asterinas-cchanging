@@ -14,7 +14,9 @@ use rustc_span::Span;
 
 use self::reuse_pool::ReusePool;
 use crate::concurrency::VClock;
-use crate::mirch::{self, PageState, kernel_code_paddr_to_vaddr, kernel_code_vaddr_to_paddr, PageTable};
+use crate::mirch::{
+    self, PageState, PageTable, kernel_code_paddr_to_vaddr, kernel_code_vaddr_to_paddr,
+};
 use crate::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -108,19 +110,12 @@ impl GlobalStateInner {
 
     fn set_address(&mut self, alloc_id: AllocId, paddr: usize) {
         let paddr = paddr as u64;
-        let pos = if self
-            .int_to_ptr_map
-            .last()
-            .is_some_and(|(last_addr, _)| *last_addr < paddr)
-        {
+        let pos = if self.int_to_ptr_map.last().is_some_and(|(last_addr, _)| *last_addr < paddr) {
             self.int_to_ptr_map.len()
         } else {
-            self
-                .int_to_ptr_map
-                .binary_search_by_key(&paddr, |(addr, _)| *addr)
-                .unwrap_err()
+            self.int_to_ptr_map.binary_search_by_key(&paddr, |(addr, _)| *addr).unwrap_err()
         };
-        
+
         self.exposed.insert(alloc_id);
         self.int_to_ptr_map.insert(pos, (paddr, alloc_id));
         self.base_addr.insert(alloc_id, paddr);
@@ -140,8 +135,8 @@ impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
 
 #[allow(invalid_reference_casting)]
 pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Allocates a new allocation at the given address for typed slot. 
-    /// 
+    /// Allocates a new allocation at the given address for typed slot.
+    ///
     /// If the `paddr` is not referred to a typed slot, it returns `None`.
     fn lazy_alloc_typed_slot_allocation(&self, paddr: usize) -> Option<AllocId> {
         let ecx = self.eval_context_ref();
@@ -150,13 +145,23 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         if let PageState::Typed { page_type: _, type_size } = page_info {
             let mut alloc_map = ecx.memory.alloc_map().0.borrow_mut();
-            
+
             let alloc_id = ecx.tcx.reserve_alloc_id();
             let actual_addr = paddr - paddr % type_size;
             let kind = rustc_const_eval::interpret::MemoryKind::Machine(MiriMemoryKind::Kernel);
             let allocation = {
-                let allocation = mirch::create_allocation_at(actual_addr, Layout::from_size_align(type_size, type_size).unwrap());
-                let extra = MiriMachine::init_alloc_extra(ecx, alloc_id, kind, allocation.size(), allocation.align).unwrap();
+                let allocation = mirch::create_allocation_at(
+                    actual_addr,
+                    Layout::from_size_align(type_size, type_size).unwrap(),
+                );
+                let extra = MiriMachine::init_alloc_extra(
+                    ecx,
+                    alloc_id,
+                    kind,
+                    allocation.size(),
+                    allocation.align,
+                )
+                .unwrap();
                 allocation.with_extra(extra)
             };
 
@@ -170,77 +175,102 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
     }
 
     /// Inits the cpu-local allocation in APs.
-    /// 
+    ///
     /// If it is a CPU-local allocation, we need to copy the context of the BSP allocation to init it.
-    /// 
-    /// FIXME: We should find a way to let KernMiri inits all BSP cpu-local allocations at beginning, 
+    ///
+    /// FIXME: We should find a way to let KernMiri inits all BSP cpu-local allocations at beginning,
     /// so that it is the users' responsibility to init the cpu-local allocation in APs.
     fn init_ap_cpu_local_allocation(&self, paddr: usize, vaddr: usize) -> Option<AllocId> {
         let ecx = self.eval_context_ref();
 
         let current_cpu_local_base = ecx.machine.threads.current_cpu_local_base();
-        if (current_cpu_local_base..current_cpu_local_base + mirch::cpu_local_segment_size()).contains(&vaddr) {
+        if (current_cpu_local_base..current_cpu_local_base + mirch::cpu_local_segment_size())
+            .contains(&vaddr)
+        {
             let global_state = ecx.machine.alloc_addresses.borrow();
-            let original_vaddr = ecx.machine.threads.cpu_local_base[0] + vaddr - current_cpu_local_base;
+            let original_vaddr =
+                ecx.machine.threads.cpu_local_base[0] + vaddr - current_cpu_local_base;
             let original_addr = mirch::page_walk_or(original_vaddr, || original_vaddr)? as u64;
-            
-            let original_pos = global_state.int_to_ptr_map.binary_search_by_key(&original_addr, |(original_addr, _)| *original_addr);
+
+            let original_pos = global_state
+                .int_to_ptr_map
+                .binary_search_by_key(&original_addr, |(original_addr, _)| *original_addr);
             let (original_alloc_id, offset) = match original_pos {
                 Ok(original_pos) => Some((global_state.int_to_ptr_map[original_pos].1, 0)),
-                Err(0) => {
-                    None
-                },
+                Err(0) => None,
                 Err(original_pos) => {
                     let (glb, alloc_id) = global_state.int_to_ptr_map[original_pos - 1];
                     let offset = original_addr - glb;
                     let size = ecx.get_alloc_info(alloc_id).0;
 
-                    if offset < size.bytes() { Some((alloc_id, offset)) } else {
-                        None
-                    }
+                    if offset < size.bytes() { Some((alloc_id, offset)) } else { None }
                 }
-            }.unwrap();
+            }
+            .unwrap();
 
             let original_alloc_info = ecx.get_alloc_info(original_alloc_id);
             let (kind, original_alloc) = &ecx.memory.alloc_map().get(original_alloc_id).unwrap();
             let kind = *kind;
             let new_alloc_id = ecx.tcx.reserve_alloc_id();
             let allocation = {
-                let mut new_allocation = mirch::create_allocation_at(paddr - offset as usize, Layout::from_size_align(original_alloc_info.0.bytes_usize(), original_alloc_info.1.bytes_usize()).unwrap());
-                let extra = MiriMachine::init_alloc_extra(ecx, new_alloc_id, kind, original_alloc_info.0, original_alloc_info.1).unwrap();
-                
-                let alloc_range = rustc_middle::mir::interpret::alloc_range(Size::ZERO, original_alloc.size());
+                let mut new_allocation = mirch::create_allocation_at(
+                    paddr - offset as usize,
+                    Layout::from_size_align(
+                        original_alloc_info.0.bytes_usize(),
+                        original_alloc_info.1.bytes_usize(),
+                    )
+                    .unwrap(),
+                );
+                let extra = MiriMachine::init_alloc_extra(
+                    ecx,
+                    new_alloc_id,
+                    kind,
+                    original_alloc_info.0,
+                    original_alloc_info.1,
+                )
+                .unwrap();
+
+                let alloc_range =
+                    rustc_middle::mir::interpret::alloc_range(Size::ZERO, original_alloc.size());
                 let init_mask = original_alloc.init_mask();
 
-                if !init_mask.is_range_initialized(alloc_range).is_err_and(|range| range.start == alloc_range.start && range.size == alloc_range.size) {
+                if !init_mask.is_range_initialized(alloc_range).is_err_and(|range| {
+                    range.start == alloc_range.start && range.size == alloc_range.size
+                }) {
                     let alloc_size_usize = original_alloc.size().bytes_usize();
                     let src_ptr = original_alloc.get_bytes_unchecked_raw();
                     let dst_ptr = new_allocation.get_bytes_unchecked_raw_mut();
                     unsafe {
                         core::ptr::copy(src_ptr, dst_ptr, alloc_size_usize);
                     }
-    
+
                     // Copy mask
                     let init_copy = init_mask.prepare_copy((0..alloc_size_usize).into());
                     new_allocation.init_mask_apply_copy(init_copy, alloc_range, 1);
-    
+
                     // Copy provenance
-                    let provenance_copy = original_alloc.provenance().prepare_copy(alloc_range, Size::ZERO, 1, ecx).unwrap();
+                    let provenance_copy = original_alloc
+                        .provenance()
+                        .prepare_copy(alloc_range, Size::ZERO, 1, ecx)
+                        .unwrap();
                     new_allocation.provenance_apply_copy(provenance_copy);
                 }
-                
+
                 new_allocation.with_extra(extra)
             };
             ecx.machine.cpu_local_alloc_set.borrow_mut().insert(new_alloc_id);
-            ecx.memory.alloc_map().0.borrow_mut().insert(new_alloc_id, Box::new((kind, allocation)));
+            ecx.memory
+                .alloc_map()
+                .0
+                .borrow_mut()
+                .insert(new_alloc_id, Box::new((kind, allocation)));
             let mut global_state = ecx.machine.alloc_addresses.borrow_mut();
             global_state.set_address(new_alloc_id, paddr - offset as usize);
             return Some(new_alloc_id);
         }
 
-        None 
+        None
     }
-
 
     // Returns the exposed `AllocId` that corresponds to the specified addr,
     // or `None` if the addr is out of bounds
@@ -254,7 +284,7 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // We always search the allocation to the right of this address. So if the size is structly
         // negative, we have to search for `addr-1` instead.
         let addr = if size >= 0 { addr } else { addr.saturating_sub(1) };
-        let pos = global_state.int_to_ptr_map.binary_search_by_key(&addr, |(addr, _)| *addr);     
+        let pos = global_state.int_to_ptr_map.binary_search_by_key(&addr, |(addr, _)| *addr);
 
         // Determine the in-bounds provenance for this pointer.
         let alloc_id = match pos {
@@ -272,9 +302,9 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 if cpu_local_in_ap.is_some() {
                     return cpu_local_in_ap;
                 }
-                
+
                 return None;
-            },
+            }
             Err(pos) => {
                 // This is the largest of the addresses smaller than `int`,
                 // i.e. the greatest lower bound (glb)
@@ -287,18 +317,20 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // allocations will *not* be recognized at their "end" address.
                 let size = ecx.get_alloc_info(alloc_id).0;
 
-                if offset < size.bytes() { Some(alloc_id) } else { 
+                if offset < size.bytes() {
+                    Some(alloc_id)
+                } else {
                     let addr = addr as usize;
                     drop(global_state);
                     let typed_slot = self.lazy_alloc_typed_slot_allocation(addr);
                     if typed_slot.is_some() {
                         return typed_slot;
                     }
-    
+
                     let cpu_local_in_ap = self.init_ap_cpu_local_allocation(addr, vaddr as usize);
                     if cpu_local_in_ap.is_some() {
                         return cpu_local_in_ap;
-                    }                    
+                    }
 
                     return None;
                 }
@@ -371,7 +403,7 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // We are not in native lib mode, so we control the addresses ourselves.
         if let Some((reuse_addr, clock)) =
             global_state.reuse.take_addr(&mut *rng, size, align, memory_kind, ecx.active_thread())
-        {   
+        {
             if let Some(clock) = clock {
                 ecx.acquire_clock(&clock);
             }
@@ -382,19 +414,26 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let mut next_stack_addr = thread.next_stack_addr.borrow_mut();
                 let base_addr = *next_stack_addr - max(size.bytes(), 1);
                 let base_addr = base_addr - base_addr % align.bytes();
-                
+
                 if base_addr < thread.stack_bottom as u64 {
                     throw_exhaust!(AddressSpaceFull);
                 }
                 *next_stack_addr = base_addr;
-                
+
                 base_addr
             } else {
-                let (next_address, limit) = if ecx.machine.cpu_local_alloc_set.borrow().contains(&alloc_id) {
-                    (&mut global_state.next_cpu_local_addr, kernel_code_paddr_to_vaddr(mirch::cpu_local_end_addr()) as u64)
-                } else {
-                    (&mut global_state.next_base_addr, kernel_code_paddr_to_vaddr(mirch::kernel_static_end_addr()) as u64)
-                };
+                let (next_address, limit) =
+                    if ecx.machine.cpu_local_alloc_set.borrow().contains(&alloc_id) {
+                        (
+                            &mut global_state.next_cpu_local_addr,
+                            kernel_code_paddr_to_vaddr(mirch::cpu_local_end_addr()) as u64,
+                        )
+                    } else {
+                        (
+                            &mut global_state.next_base_addr,
+                            kernel_code_paddr_to_vaddr(mirch::kernel_static_end_addr()) as u64,
+                        )
+                    };
 
                 // We have to pick a fresh address.
                 // Leave some space to the previous allocation, to give it some chance to be less aligned.
@@ -444,7 +483,10 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     self.addr_from_alloc_id_uncached(global_state, alloc_id, memory_kind)?;
                 trace!("Assigning base address {:#x} to allocation {:?}", base_vaddr, alloc_id);
 
-                let base_addr = mirch::page_walk_or(base_vaddr as usize, || kernel_code_vaddr_to_paddr(base_vaddr as usize)).unwrap() as u64;
+                let base_addr = mirch::page_walk_or(base_vaddr as usize, || {
+                    kernel_code_vaddr_to_paddr(base_vaddr as usize)
+                })
+                .unwrap() as u64;
 
                 // Store address in cache.
                 global_state.base_addr.try_insert(alloc_id, base_addr).unwrap();
@@ -468,7 +510,7 @@ pub trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 base_vaddr
             }
         };
-        
+
         interp_ok(addr)
     }
 }
@@ -557,37 +599,57 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let alloc_size_usize = old_allocation.size().bytes_usize();
             if alloc_size_usize > 0 {
                 let (new_allocation, kind) = {
-                    
-                    let mut allocation = mirch::create_allocation_at(base_paddr as usize, Layout::from_size_align(old_allocation.size().bytes_usize(), old_allocation.align.bytes_usize()).unwrap());
-                    let extra = MiriMachine::init_alloc_extra(ecx, alloc_id, *kind, old_allocation.size(), old_allocation.align)?;
-                    
-                    let alloc_range = rustc_middle::mir::interpret::alloc_range(Size::ZERO, old_allocation.size());
+                    let mut allocation = mirch::create_allocation_at(
+                        base_paddr as usize,
+                        Layout::from_size_align(
+                            old_allocation.size().bytes_usize(),
+                            old_allocation.align.bytes_usize(),
+                        )
+                        .unwrap(),
+                    );
+                    let extra = MiriMachine::init_alloc_extra(
+                        ecx,
+                        alloc_id,
+                        *kind,
+                        old_allocation.size(),
+                        old_allocation.align,
+                    )?;
+
+                    let alloc_range = rustc_middle::mir::interpret::alloc_range(
+                        Size::ZERO,
+                        old_allocation.size(),
+                    );
                     let init_mask = old_allocation.init_mask();
-                    
-                    if !init_mask.is_range_initialized(alloc_range).is_err_and(|range| range.start == alloc_range.start && range.size == alloc_range.size) {
+
+                    if !init_mask.is_range_initialized(alloc_range).is_err_and(|range| {
+                        range.start == alloc_range.start && range.size == alloc_range.size
+                    }) {
                         // Copy context
                         let src_ptr = old_allocation.get_bytes_unchecked_raw();
                         let dst_ptr = allocation.get_bytes_unchecked_raw_mut();
                         unsafe {
                             core::ptr::copy(src_ptr, dst_ptr, alloc_size_usize);
                         }
-        
+
                         // Copy mask
                         let init_copy = init_mask.prepare_copy((0..alloc_size_usize).into());
                         allocation.init_mask_apply_copy(init_copy, alloc_range, 1);
-        
+
                         // Copy provenance
-                        let provenance_copy = old_allocation.provenance().prepare_copy(alloc_range, Size::ZERO, 1, ecx).unwrap();
+                        let provenance_copy = old_allocation
+                            .provenance()
+                            .prepare_copy(alloc_range, Size::ZERO, 1, ecx)
+                            .unwrap();
                         allocation.provenance_apply_copy(provenance_copy);
                     }
                     (allocation.with_extra(extra), *kind)
-                }; 
+                };
 
-                alloc_map.0.borrow_mut().insert(alloc_id, Box::new((kind,new_allocation)));
+                alloc_map.0.borrow_mut().insert(alloc_id, Box::new((kind, new_allocation)));
             }
         }
         // Get a pointer to the beginning of this allocation.
-        
+
         let base_ptr = interpret::Pointer::new(
             Provenance::Concrete { alloc_id, tag },
             Size::from_bytes(base_addr),
@@ -653,7 +715,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // must have been called in the past, so we can just look up the address in the map.
         let base_addr = *global_state.base_addr.get(&alloc_id).unwrap();
 
-        let actual_addr = mirch::page_walk_or(addr.bytes_usize(), || kernel_code_vaddr_to_paddr(addr.bytes_usize())).unwrap() as u64;
+        let actual_addr = mirch::page_walk_or(addr.bytes_usize(), || {
+            kernel_code_vaddr_to_paddr(addr.bytes_usize())
+        })
+        .unwrap() as u64;
 
         let offset = actual_addr.wrapping_sub(base_addr);
 

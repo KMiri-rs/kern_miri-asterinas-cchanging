@@ -239,10 +239,10 @@ pub struct Thread<'tcx> {
 
     /// Records for the addresses of the stack frames in the current thread.
     pub(crate) stack_addr_records: Vec<u64>,
-    
+
     /// The stack address for the next stack variable.
     pub(crate) next_stack_addr: RefCell<u64>,
-    
+
     /// The stack bottom of the current thread.
     pub(crate) stack_bottom: u64,
 
@@ -348,7 +348,11 @@ impl<'tcx> std::fmt::Debug for Thread<'tcx> {
 }
 
 impl<'tcx> Thread<'tcx> {
-    fn new(name: Option<&str>, on_stack_empty: Option<StackEmptyCallback<'tcx>>, stack_range: Range<u64>) -> Self {
+    fn new(
+        name: Option<&str>,
+        on_stack_empty: Option<StackEmptyCallback<'tcx>>,
+        stack_range: Range<u64>,
+    ) -> Self {
         Self {
             state: ThreadState::Enabled,
             thread_name: name.map(|name| Vec::from(name.as_bytes())),
@@ -475,7 +479,7 @@ pub struct ThreadManager<'tcx> {
     /// Identifier of the currently active CPU number.
     pub active_cpu: usize,
     /// The CPU number that will be active in the next iteration.
-    /// 
+    ///
     /// The machine will keep the old executed CPU if the value is `None`.
     pub next_cpu: Option<usize>,
     /// An array stores the mapping between CPU number and the `ThreadId`.
@@ -490,7 +494,7 @@ pub struct ThreadManager<'tcx> {
     thread_local_allocs: FxHashMap<(DefId, ThreadId), StrictPointer>,
     /// A flag that indicates that we should change the active thread.
     yield_active_thread: bool,
-    /// An array records ID of the next thread to execute for each CPU. 
+    /// An array records ID of the next thread to execute for each CPU.
     next_thread: [Option<ThreadId>; crate::machine::CPU_NUM],
 }
 
@@ -505,7 +509,7 @@ impl VisitProvenance for ThreadManager<'_> {
             cpu_to_threads: _,
             cpu_local_base: _,
             yield_active_thread: _,
-            next_thread: _
+            next_thread: _,
         } = self;
 
         for thread in threads {
@@ -521,16 +525,15 @@ impl<'tcx> Default for ThreadManager<'tcx> {
     fn default() -> Self {
         let mut threads = IndexVec::new();
         // Create the main thread and add it to the list of threads.
-        threads.push(
-            Thread::new(
-                Some("main"), 
-                None, 
-                kernel_code_paddr_to_vaddr(mirch::kernel_stack_start_addr()) as u64..kernel_code_paddr_to_vaddr(mirch::kernel_stack_end_addr()) as u64
-            )
-        );
+        threads.push(Thread::new(
+            Some("main"),
+            None,
+            kernel_code_paddr_to_vaddr(mirch::kernel_stack_start_addr()) as u64
+                ..kernel_code_paddr_to_vaddr(mirch::kernel_stack_end_addr()) as u64,
+        ));
         let mut cpu_to_threads = [None; CPU_NUM];
         cpu_to_threads[0] = Some(ThreadId::MAIN_THREAD);
-        
+
         Self {
             active_thread: ThreadId::MAIN_THREAD,
             cpu_to_threads,
@@ -540,7 +543,7 @@ impl<'tcx> Default for ThreadManager<'tcx> {
             threads,
             thread_local_allocs: Default::default(),
             yield_active_thread: false,
-            next_thread: [None; CPU_NUM]
+            next_thread: [None; CPU_NUM],
         }
     }
 }
@@ -595,9 +598,13 @@ impl<'tcx> ThreadManager<'tcx> {
     }
 
     /// Create a new thread and returns its id.
-    /// 
+    ///
     /// The new thread will use the `stack_range` as its stack.
-    fn create_thread(&mut self, on_stack_empty: StackEmptyCallback<'tcx>, stack_range: Range<u64>) -> ThreadId {
+    fn create_thread(
+        &mut self,
+        on_stack_empty: StackEmptyCallback<'tcx>,
+        stack_range: Range<u64>,
+    ) -> ThreadId {
         let new_thread_id = ThreadId::new(self.threads.len());
         self.threads.push(Thread::new(None, Some(on_stack_empty), stack_range));
         new_thread_id
@@ -838,8 +845,7 @@ impl<'tcx> ThreadManager<'tcx> {
                     return interp_ok(SchedulingAction::ExecuteStep);
                 }
                 return interp_ok(SchedulingAction::ExecuteStep);
-            }
-            else {
+            } else {
                 throw_machine_stop!(TerminationInfo::Deadlock);
             }
         }
@@ -881,7 +887,9 @@ impl<'tcx> ThreadManager<'tcx> {
             .chain(self.threads.iter_enumerated().take(self.active_thread.index()));
         for (id, thread) in threads {
             debug_assert_ne!(self.active_thread, id);
-            if thread.state.is_enabled() && !self.cpu_to_threads[1].is_some_and(|thread_id| thread_id == id){
+            if thread.state.is_enabled()
+                && self.cpu_to_threads[1].is_none_or(|thread_id| thread_id != id)
+            {
                 info!(
                     "---------- Now executing on thread `{}` (previous: `{}`) ----------------------------------------",
                     self.get_thread_display_name(id),
@@ -1020,15 +1028,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         start_abi: ExternAbi,
         func_arg: ImmTy<'tcx>,
         ret_layout: TyAndLayout<'tcx>,
-        stack_range: Option<Range<u64>>
+        stack_range: Option<Range<u64>>,
     ) -> InterpResult<'tcx, ThreadId> {
         let this = self.eval_context_mut();
 
         // Create the new thread
-        let new_thread_id = this.machine.threads.create_thread({
-            let mut state = tls::TlsDtorsState::default();
-            Box::new(move |m| state.on_stack_empty(m))
-        }, stack_range.unwrap_or(0..0));
+        let new_thread_id = this.machine.threads.create_thread(
+            {
+                let mut state = tls::TlsDtorsState::default();
+                Box::new(move |m| state.on_stack_empty(m))
+            },
+            stack_range.unwrap_or(0..0),
+        );
         let current_span = this.machine.current_span();
         if let Some(data_race) = &mut this.machine.data_race {
             data_race.thread_created(&this.machine.threads, new_thread_id, current_span);
@@ -1321,7 +1332,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         unsafe {
                             let value = *(mirch::paddr_to_mem(pt_address) as *mut usize);
                             let written_addr = value & !(mirch::page_size() - 1);
-                            if let PageState::Typed { .. } = mirch::physical_mem().page_states[written_addr as usize/ mirch::page_size()] {
+                            if let PageState::Typed { .. } = mirch::physical_mem().page_states
+                                [written_addr as usize / mirch::page_size()]
+                            {
                                 let _global_states = this.machine.alloc_addresses.borrow();
                                 //..todo!()
                             }
